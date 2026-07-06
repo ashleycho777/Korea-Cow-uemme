@@ -2,18 +2,18 @@
 constructor.py — 구성 휴리스틱 + 상태 API (2단계 모듈 B, 상태 기반 리팩터)
 ========================================================================
 
-placement.py(모듈 A) 를 시간 축 위에서 여러 번 눌러서, 다섯 결정
-(베이·위치·방향·지연·취소)을 채우도록 시킨다.
+placement.py(모듈 A) 를 시간 축 위에 올려, 다섯 결정
+(베이 · 위치 · 방향 · 진입 · 퇴출)을 그리디로 푼다.
 
 이 버전은 LNS(3단계)가 쓸 수 있도록 '상태(State)' API 를 노출한다:
   - new_state(prob_info)          : 빈 상태
-  - insert_block(state, bid, ...) : 블록 1개를 최적 베이·시간·위치에 배치
+  - insert_block(state, bid, ...) : 블록 1개를 최적 베이·시각·위치에 배치
   - remove_block(state, bid)      : 블록 1개 제거
-  - clone_state(state)            : 상태 복사(되돌리기용)
-  - objective(state)              : 채점 기준과 동일한 (obj, o1, o2, o3)
-  - build_operations(state)       : 최종 오퍼레이션 딕셔너리
+  - clone_state(state)            : 얕은 복제(되돌리기용)
+  - objective(state)              : 채점기와 동일한 (obj, o1, o2, o3)
+  - build_operations(state)       : 해 딕셔너리
 
-흐름/실행가능성/안전 여지 설명은 기존과 동일(README 주석 참조).
+흐름/실현가능성/안전영역 설명은 기존과 동일(README 주석 참조).
 
 공개 진입점:  solve(prob_info, timelimit=60) -> {"operations": {...}}
 """
@@ -52,6 +52,7 @@ class State:
     placed: dict                 # block_id -> PlacedBlock
     by_bay: list                 # bay_id -> list[PlacedBlock]
     load: list                   # bay_id -> 누적 workload
+    fast: bool = False           # True 면 AABB 고속 배치 경로 사용(대규모용)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +72,7 @@ def _block_area(block_data: dict) -> float:
 
 
 def order_blocks_edd(blocks: list) -> list:
-    """EDD: 마감 asc, 릴리즈 asc, 면적 큰 것 먼저."""
+    """EDD: 납기 asc, 릴리즈 asc, 면적 큰 것 먼저."""
     idx = list(range(len(blocks)))
     idx.sort(key=lambda i: (blocks[i]["due_date"],
                             blocks[i]["release_time"],
@@ -97,17 +98,26 @@ def _obstacles_at(placed: list, t: int, proc: int) -> list:
     return [pb.obstacle for pb in placed if pb.entry < end and t < pb.exit]
 
 
-def _earliest_in_bay(bay, bid, instance, placed, release, proc, deadline):
+def _earliest_in_bay(bay, bid, instance, placed, release, proc, deadline, fast=False):
+    place = P.find_placement_aabb if fast else P.find_placement
     times = _candidate_times(placed, release, proc)
+    bay_area = bay.width * bay.height
+    blk_area = P.block_footprint_area(bid, instance)
     for t in times:
         if deadline is not None and time.perf_counter() > deadline:
-            # 시간 초과: '빈-베이 보장 시간'(후보 중 최댓값)만 시도.
-            # 이 시간엔 장애물이 없으므로, 블록이 이 베이에 들어가면 반드시 배치된다.
+            # 시간 초과: '빈-베이 보장 시각'(후보의 최대값)만 시도.
+            # 이 시각엔 장애물이 없으므로, 블록이 이 베이에 들어가면 반드시 배치된다.
             t_empty = times[-1]
-            pl = P.find_placement(bay, bid, instance,
-                                  _obstacles_at(placed, t_empty, proc))
+            pl = place(bay, bid, instance, _obstacles_at(placed, t_empty, proc))
             return (t_empty, pl) if pl is not None else None
-        pl = P.find_placement(bay, bid, instance, _obstacles_at(placed, t, proc))
+        obs = _obstacles_at(placed, t, proc)
+        # 면적 사전검사(필요조건): 자유면적 < 블록면적이면 절대 못 들어감 -> 비싼 배치 시도 생략.
+        occ = 0.0
+        for o in obs:
+            occ += o.area
+        if bay_area - occ < blk_area - 1e-9:
+            continue
+        pl = place(bay, bid, instance, obs)
         if pl is not None:
             return t, pl
     return None
@@ -116,6 +126,10 @@ def _earliest_in_bay(bay, bid, instance, placed, release, proc, deadline):
 # ---------------------------------------------------------------------------
 # 상태 API
 # ---------------------------------------------------------------------------
+# 이 블록 수를 넘으면 AABB 고속 배치 경로 사용(폴리곤 경로가 O(n²)로 느려지는 구간).
+FAST_THRESHOLD = 100
+
+
 def new_state(prob_info: dict) -> State:
     bays = [Bay.from_dict(b, i) for i, b in enumerate(prob_info["bays"])]
     w = prob_info.get("weights", {})
@@ -124,6 +138,7 @@ def new_state(prob_info: dict) -> State:
         w1=w.get("w1", 1.0), w2=w.get("w2", 0.0), w3=w.get("w3", 0.0),
         u=_bay_weights(bays),
         placed={}, by_bay=[[] for _ in bays], load=[0.0] * len(bays),
+        fast=(len(prob_info["blocks"]) > FAST_THRESHOLD),
     )
 
 
@@ -133,11 +148,12 @@ def clone_state(s: State) -> State:
         placed=dict(s.placed),
         by_bay=[lst[:] for lst in s.by_bay],
         load=s.load[:],
+        fast=s.fast,
     )
 
 
 def insert_block(state: State, bid: int, deadline=None) -> bool:
-    """블록 bid 를 현재 상태의 최적(목적함수 미러링)으로 배치. 성공 여부 반환."""
+    """블록 bid 를 현재 상태에 최적(목적함수 미러링)으로 배치. 성공 여부 반환."""
     bd = state.instance["blocks"][bid]
     R = bd["release_time"]; D = bd["due_date"]
     P_ = bd["processing_time"]; L = bd["workload"]
@@ -146,7 +162,7 @@ def insert_block(state: State, bid: int, deadline=None) -> bool:
     best = None  # (score, bay_id, entry, placement)
     for j, bay in enumerate(state.bays):
         res = _earliest_in_bay(bay, bid, state.instance, state.by_bay[j],
-                               R, P_, deadline)
+                               R, P_, deadline, state.fast)
         if res is None:
             continue
         entry, pl = res
@@ -182,7 +198,7 @@ def remove_block(state: State, bid: int) -> None:
 
 
 def objective(state: State):
-    """채점 기준과 동일한 (objective, obj1, obj2, obj3)."""
+    """채점기와 동일한 (objective, obj1, obj2, obj3)."""
     blocks = state.instance["blocks"]
     o1 = 0.0; o3 = 0.0
     for bid, pb in state.placed.items():
@@ -218,7 +234,7 @@ def build_operations(state: State) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 그리드 구성
+# 그리디 구성
 # ---------------------------------------------------------------------------
 def construct(prob_info: dict, timelimit: float = 60.0,
               verbose: bool = False) -> dict:
@@ -233,7 +249,7 @@ def construct(prob_info: dict, timelimit: float = 60.0,
 
 
 def build_state(prob_info: dict, deadline=None, verbose: bool = False) -> State:
-    """그리드로 채운 State 를 반환(LNS 초기화에도 사용)."""
+    """그리디로 채운 State 를 반환(LNS 의 시작점으로도 사용)."""
     state = new_state(prob_info)
     for bid in order_blocks_edd(prob_info["blocks"]):
         ok = insert_block(state, bid, deadline)

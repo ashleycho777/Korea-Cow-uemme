@@ -5,24 +5,24 @@ placement.py — 폴리곤 bottom-left-fill 배치 엔진 (2단계 모듈 A)
 역할
 ----
 "베이 + 배치할 블록 하나 + 이미 놓인 장애물 목록"을 받아,
-장애물과 footprint(전면 투영)가 겹치지 않는 정수 (x, y, 방향)을 찾아 돌려준다.
+장애물과 footprint(평면 투영)가 겹치지 않는 정수 (x, y, 방향)을 찾아 돌려준다.
 못 찾으면 None.
 
 왜 footprint 비중첩인가
 -----------------------
-크레인 하역 규칙은 "새 블록 레이어 k가 기존 블록의 같거나 더 높은 레이어(j>=k)와
-평면상 겹칠 때만 막힌다"이다. 따라서 두 블록의 **전체 footprint(모든 레이어 합집합)**가
-평면상 겹치면:
+크레인 판정 규칙은 "새 블록 레이어 k가 기존 블록의 같거나 더 높은 레이어(j>=k)와
+평면상 겹칠 때만 막힘"이다. 따라서 두 블록의 **전체 footprint(모든 레이어 합집합)**가
+아예 안 겹치면:
   - 충돌 제약(같은 레벨 겹침) : 통과
   - 크레인 진입/퇴출 제약       : 통과
-즉 비중첩 배치만 하면 평면 공간·크레인 실행가능성이 *공짜로* 보장된다.
+즉 비중첩 배치만 하면 공간·크레인 실현가능성이 *공짜로* 보장된다.
 (서로 다른 레벨로 끼워 넣는 interlocking 은 더 빽빽하지만 위험 — 3단계에서 다룸.)
 
-채점 기준과의 일관성
+채점기와의 일관성
 -----------------
 utils.Block 으로 블록 기하를 만들고, 폴리곤은 utils 와 동일하게
 invalid 일 때 buffer(0) 으로 보정한다. 좌표는 정수만 생성한다
-(배치 x,y 는 정수여야 하고 채점기는 반올림하므로).
+(해의 x,y 는 정수여야 하고 채점기도 반올림하므로).
 """
 from __future__ import annotations
 
@@ -75,12 +75,29 @@ class Obstacle:
     block: Block
     footprint: object
     bbox: tuple  # (min_x, min_y, max_x, max_y)
+    area: float = 0.0
 
 
 def make_obstacle(block: Block) -> Obstacle:
-    return Obstacle(block=block,
-                    footprint=footprint_polygon(block.layers_at_pos()),
-                    bbox=block.bounding_rect())
+    fp = footprint_polygon(block.layers_at_pos())
+    return Obstacle(block=block, footprint=fp,
+                    bbox=block.bounding_rect(),
+                    area=(fp.area if fp is not None else 0.0))
+
+
+# 블록 footprint 면적 캐시: (id(instance), block_id) -> 면적 (orient 0 기준).
+# 면적 사전검사(자유면적 부족 시 배치 시도 생략)에 사용.
+_AREA_CACHE: dict = {}
+
+
+def block_footprint_area(block_id: int, instance: dict) -> float:
+    key = (id(instance), block_id)
+    a = _AREA_CACHE.get(key)
+    if a is None:
+        og = _orient_geom(block_id, instance, 0)
+        a = og.base_fp.area if og is not None else 0.0
+        _AREA_CACHE[key] = a
+    return a
 
 
 @dataclass
@@ -91,12 +108,12 @@ class Placement:
     y: int
     orient_idx: int
     block: Block
-    top_y: float       # 배치 후 상변 (낮을수록 좋음 = 바닥에 가까움)
+    top_y: float       # 배치 후 윗변 (낮을수록 좋음 = 바닥에 가까움)
     right_x: float     # 배치 후 우변 (낮을수록 좋음 = 왼쪽에 가까움)
 
     @property
     def key(self):
-        # bottom-left 우선: 상변이 낮고, 그다음 우변이 낮고, 그다음 좌표순
+        # bottom-left 선호: 윗변이 낮고, 그다음 우변이 낮고, 그다음 좌하단
         return (self.top_y, self.right_x, self.x, self.y)
 
 
@@ -116,6 +133,7 @@ _GEOM_CACHE: dict = {}
 def clear_cache() -> None:
     """인스턴스가 바뀔 때 호출(보통 불필요 — 인스턴스는 실행 중 불변)."""
     _GEOM_CACHE.clear()
+    _AREA_CACHE.clear()
 
 
 def _orient_geom(block_id: int, instance: dict, orient_idx: int) -> Optional[_OrientGeom]:
@@ -139,11 +157,11 @@ def _compute_orient_geom(block_id: int, instance: dict, orient_idx: int) -> Opti
 
 
 # ---------------------------------------------------------------------------
-# 후보 위치 생성 (벽 + 장애물 bbox 모서리 + 폴리곤 꼭지점)
+# 후보 위치 생성 (벽 + 장애물 bbox 모서리 + 폴리곤 꼭짓점)
 # ---------------------------------------------------------------------------
 def _candidate_edges(obstacles: list[Obstacle], bay: Bay,
                      vertex_level: bool) -> tuple[list[float], list[float]]:
-    """새 블록의 좌변/하변이 붙을 수 있는 후보 x/y 모음."""
+    """새 블록의 좌변/하변이 닿을 수 있는 후보 x/y 모음."""
     xs = {0.0}
     ys = {0.0}
     for o in obstacles:
@@ -175,6 +193,74 @@ def _int_refs(edges: list[float], local_min: float,
 # ---------------------------------------------------------------------------
 # 핵심: 배치 찾기
 # ---------------------------------------------------------------------------
+def find_placement_aabb(bay: Bay,
+                        block_id: int,
+                        instance: dict,
+                        obstacles: list[Obstacle],
+                        orient_indices: Optional[Iterable[int]] = None
+                        ) -> Optional[Placement]:
+    """
+    고속 배치: 블록/장애물을 바운딩박스(AABB)로만 다뤄 순수 정수 구간 연산으로 배치.
+    폴리곤 translate/교차가 전혀 없어 폴리곤 경로보다 10~100배 빠르다.
+
+    AABB 비중첩은 footprint 비중첩보다 강한 조건이므로 항상 실현가능(안전영역).
+    대신 오목한 틈을 못 써서 밀도는 낮다 -> 대규모/밀집 인스턴스에서
+    '구성을 빨리 끝내 LNS 시간을 버는' 용도로 사용.
+    """
+    n_or = len(instance["blocks"][block_id]["shape"])
+    if orient_indices is None:
+        orient_indices = range(n_or)
+
+    rects = [o.bbox for o in obstacles]
+    # 후보 좌변 = 벽 + 장애물 우변; 후보 하변 = 바닥 + 장애물 윗변 (표준 bottom-left)
+    xedges = {0.0}
+    yedges = {0.0}
+    for (x0, y0, x1, y1) in rects:
+        xedges.add(x1)
+        yedges.add(y1)
+
+    best: Optional[Placement] = None
+    for oi in orient_indices:
+        og = _orient_geom(block_id, instance, oi)
+        if og is None:
+            continue
+        if (og.lx1 - og.lx0) > bay.width + _TOL or (og.ly1 - og.ly0) > bay.height + _TOL:
+            continue
+        xs = _int_refs(sorted(xedges), og.lx0, og.lx1, bay.width)
+        ys = _int_refs(sorted(yedges), og.ly0, og.ly1, bay.height)
+
+        found = None
+        for y in ys:
+            cminy = y + og.ly0
+            cmaxy = y + og.ly1
+            for x in xs:
+                cminx = x + og.lx0
+                cmaxx = x + og.lx1
+                ok = True
+                for (bx0, by0, bx1, by1) in rects:
+                    if (cmaxx <= bx0 + _TOL or bx1 <= cminx + _TOL
+                            or cmaxy <= by0 + _TOL or by1 <= cminy + _TOL):
+                        continue
+                    ok = False
+                    break
+                if ok:
+                    found = (x, y)
+                    break
+            if found:
+                break
+
+        if found is not None:
+            x, y = found
+            cand = Placement(
+                block_id=block_id, x=x, y=y, orient_idx=oi,
+                block=Block.from_instance(block_id, instance, x=x, y=y, orient_idx=oi),
+                top_y=y + og.ly1, right_x=x + og.lx1,
+            )
+            if best is None or cand.key < best.key:
+                best = cand
+    return best
+
+
 def find_placement(bay: Bay,
                    block_id: int,
                    instance: dict,
@@ -186,14 +272,14 @@ def find_placement(bay: Bay,
     block_id 블록을 bay 에, obstacles 와 겹치지 않게 배치할 (x,y,방향)을 찾는다.
 
     bottom-left 우선: 각 방향마다 가장 낮고-왼쪽 자리를 찾고,
-    방향들 사이에서 가장 빽빽한(상변 낮은) 것을 고른다.
+    방향들 사이에서 가장 빽빽한(윗변 낮은) 것을 고른다.
 
     Parameters
     ----------
     obstacles    : 이 블록과 시간이 겹치는, 이미 놓인 블록들의 Obstacle 목록.
     orient_indices : 시도할 방향(기본 전체).
-    vertex_level : True 면 장애물 폴리곤 꼭지점까지 후보로 -> 촘촘한 탐색 늘림.
-    grid_step    : >0 이면 그 간격의 정수 격자도 후보에 추가(안정성 보강, 느려짐).
+    vertex_level : True 면 장애물 폴리곤 꼭짓점까지 후보로 -> 오목한 틈에 끼움.
+    grid_step    : >0 이면 그 간격의 정수 격자도 후보에 추가(완전성 보강, 느려짐).
 
     Returns
     -------
@@ -205,7 +291,7 @@ def find_placement(bay: Bay,
 
     cand_xs, cand_ys = _candidate_edges(obstacles, bay, vertex_level)
 
-    # 장애물 prepared 폴리곤 + bbox (빠른 교차 필터)
+    # 장애물 prepared 폴리곤 + bbox (빠른 교차 판정)
     prepared = [(o.bbox, _shp_prep(o.footprint))
                 for o in obstacles if o.footprint is not None]
 
@@ -218,7 +304,7 @@ def find_placement(bay: Bay,
         bw = og.lx1 - og.lx0
         bh = og.ly1 - og.ly0
         if bw > bay.width + _TOL or bh > bay.height + _TOL:
-            continue  # 이 방향으로는 베이에 아예 안 들어감
+            continue  # 이 방향으론 베이에 아예 안 들어감
 
         xs = _int_refs(cand_xs, og.lx0, og.lx1, bay.width)
         ys = _int_refs(cand_ys, og.ly0, og.ly1, bay.height)
@@ -247,10 +333,10 @@ def _first_fit(og: _OrientGeom, xs: list[int], ys: list[int],
     """
     (y,x) 오름차순 bottom-left 로 첫 비중첩 위치를 찾아 즉시 반환.
 
-    성능 최적화(품질은 동일):
+    속도 최적화(품질은 동일):
       - 후보 AABB 가 어떤 장애물 AABB 와도 안 겹치면 -> 빈 공간, 폴리곤 연산 없이 즉시 채택.
       - 겹치는 장애물이 있을 때만 폴리곤 1회 translate + 그 몇 개와 교차검사.
-      - 첫 적합에서 바로 반환(조기 종료) -> 빈 영역에서 거의 즉시 끝남.
+      - 첫 적합에서 바로 반환(조기 종료) -> 빈 영역에선 거의 즉시 끝남.
     """
     for y in ys:
         cminy = y + og.ly0
@@ -271,8 +357,8 @@ def _first_fit(og: _OrientGeom, xs: list[int], ys: list[int],
             if hits is None:
                 return (x, y)          # 빈 공간: 폴리곤 연산 없이 채택
             # 폴리곤 정밀 검사 (겹칠 가능성 있는 것만).
-            # 충돌 = '내부-내부가 2D(면적)로 겹침'. 변만 닿는 건 허용.
-            # relate_pattern('2********') 은 기하 생성 없이 술어만 평가 -> 변이 빠르게 기각.
+            # 충돌 = '내부-내부가 2D(면적)로 겹침'. 변끼리만 닿는 건 허용.
+            # relate_pattern('2********') 은 기하 생성 없이 술어만 평가 -> 변접촉 빠르게 기각.
             cand_fp = _shp_translate(og.base_fp, xoff=x, yoff=y)
             ok = True
             for pgeom in hits:
@@ -285,7 +371,7 @@ def _first_fit(og: _OrientGeom, xs: list[int], ys: list[int],
 
 
 # ---------------------------------------------------------------------------
-# 시각 테스트: 시간 무시하고 한 베이에 최대한 채워보며 무결성 검증
+# 자가 테스트: 시간 무시하고 한 베이에 최대한 채워보며 엔진 검증
 # ---------------------------------------------------------------------------
 def _self_test(instance_path: str):
     import json
@@ -302,7 +388,7 @@ def _self_test(instance_path: str):
             pl = find_placement(bay, bid, inst, obstacles)
             if pl is None:
                 continue
-            # 비중첩 재확인 (알고리즘 자체 검증)
+            # 비중첩 재확인 (엔진 자체 검증)
             new_fp = footprint_polygon(pl.block.layers_at_pos())
             for o in obstacles:
                 inter = new_fp.intersection(o.footprint)
@@ -313,7 +399,7 @@ def _self_test(instance_path: str):
             used_area += new_fp.area
         util = 100 * used_area / (bay.width * bay.height)
         print(f"  bay{bay.id} ({bay.width}x{bay.height}): "
-              f"누적 배치 {placed}/{n_blocks}개, 면적 활용률 {util:.1f}%  (비중첩 검증 통과)")
+              f"동시 배치 {placed}/{n_blocks}개, 면적 활용률 {util:.1f}%  (비중첩 검증 통과)")
 
 
 if __name__ == "__main__":

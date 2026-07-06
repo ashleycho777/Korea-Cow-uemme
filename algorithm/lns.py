@@ -2,21 +2,21 @@
 lns.py — Large Neighborhood Search 개선 루프 (3단계 모듈 D)
 ==========================================================
 
-constructor 의 그리드 해에서 출발해, 남은 시간이 허용되는 동안
+constructor 의 그리디 해에서 출발해, 남는 시간제한 동안
 '일부를 뜯어내고(destroy) 다시 끼워넣기(repair)'를 반복하며 점수를 낮춘다.
-시간을 인자로 늦어지는 anytime 알고리즘.
+시간을 쓸수록 좋아지는 anytime 알고리즘.
 
-항상 실행가능한가
+왜 항상 실현가능한가
 --------------------
 repair 는 constructor.insert_block 을 쓰고, 그 후보 시각에는 '빈-베이 시각'이
-항상 포함된다 -> 어떤 블록도 (자기가 들어갈 베이가 비어있으면) 반드시 재배치된다.
-게다가 삽입 자체가 footprint 비중첩이라 충돌·크레인 실행가능성 항상 통과.
+항상 포함된다 -> 어떤 블록도 (자기가 들어갈 베이가 있으면) 반드시 재배치된다.
+게다가 안전영역(footprint 비중첩)이라 충돌·크레인도 자동 통과.
 
 구성
 ----
-- destroy: worst_tardiness / random / related(Shaw)   (적응 가중 선택)
-- repair : 제거 블록을 (여유 순 / EDD / 무작위) 로 재삽입
-- accept : Record-to-Record Travel (최고 해 대비 허용치가 시간에 따라 수축)
+- destroy: worst_tardiness / random / related(Shaw)   (적응형 가중 선택)
+- repair : 제거 블록을 (여유 적은 순 / EDD / 무작위) 로 재삽입
+- accept : Record-to-Record Travel (최고해 대비 허용폭이 시간에 따라 수축)
 
 공개 진입점:  solve(prob_info, timelimit=60) -> {"operations": {...}}
 """
@@ -124,7 +124,7 @@ def lns(prob_info: dict, timelimit: float = 60.0, seed: int = 12345,
     safety = min(3.0, 0.05 * timelimit)
     deadline = t0 + max(1.0, timelimit - safety)
 
-    # --- 초기화: 그리드 구성 (시간의 일부만 사용) ---
+    # --- 시작점: 그리디 구성 (시간의 일부만 사용) ---
     build_deadline = t0 + min(deadline - t0, max(2.0, 0.4 * (deadline - t0)))
     current = C.build_state(prob_info, build_deadline, verbose)
     best = C.clone_state(current)
@@ -146,14 +146,14 @@ def lns(prob_info: dict, timelimit: float = 60.0, seed: int = 12345,
     while time.perf_counter() < deadline and n > 1:
         iters += 1
         progress = (time.perf_counter() - t0) / (deadline - t0)
-        dev = 0.02 * (1.0 - progress)              # RRT 허용치, 0 으로 수축
+        dev = 0.02 * (1.0 - progress)              # RRT 허용폭, 0 으로 수축
 
         cand = C.clone_state(current)
         k = rng_k(weights, kmax)
         op_idx = roulette(weights)
         removed = DESTROY_OPS[op_idx](cand, k, _RNG)
         repair(cand, removed, _RNG, deadline)
-        # 안전성 가드: 모든 블록이 배치된 해만 유효(미배치 해는 obj가 낮게 나와 오염될 수 있음)
+        # 완전성 가드: 모든 블록이 배치된 해만 유효(미배정 해는 obj가 낮게 나와 오채택될 수 있음)
         if len(cand.placed) != n:
             continue
         new_obj = C.objective(cand)[0]
@@ -179,7 +179,7 @@ def lns(prob_info: dict, timelimit: float = 60.0, seed: int = 12345,
     return C.build_operations(best)
 
 
-# rng 래퍼 (모듈 전역 RNG — 재현성) ----------------------------------------
+# rng 헬퍼 (모듈 전역 RNG — 재현성) ----------------------------------------
 _RNG = random.Random(12345)
 
 
@@ -202,7 +202,7 @@ def rng_k(weights, kmax) -> int:
 def solve(prob_info: dict, timelimit: float = 60.0) -> dict:
     global _RNG
     _RNG = random.Random(12345)
-    P.clear_cache()          # 인스턴스별 기하 캐시 격리(여러 인스턴스 연속 실행 대비)
+    P.clear_cache()          # 인스턴스별 기하 캐시 격리(여러 인스턴스 연속 실행 안전)
     return lns(prob_info, timelimit=timelimit, verbose=False)
 
 
