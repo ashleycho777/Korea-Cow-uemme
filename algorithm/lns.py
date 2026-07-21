@@ -92,7 +92,31 @@ def destroy_related(state: C.State, k: int, rng: random.Random) -> list:
     return chosen
 
 
-DESTROY_OPS = [destroy_worst_tardiness, destroy_random, destroy_related]
+def destroy_tardy_cluster(state: C.State, k: int, rng: random.Random) -> list:
+    """가장 지각 큰 블록 + 그 블록의 이른 배치를 막는(같은 베이·시간창 겹침) 블록들을 함께 제거.
+    자리를 터줘서 repair 가 지각 블록을 일찍 넣을 수 있게 한다. 지각(Z1)을 직접 겨냥."""
+    blocks = state.instance["blocks"]
+    tardy = [(max(0, pb.exit - blocks[bid]["due_date"]), bid)
+             for bid, pb in state.placed.items()]
+    tardy.sort(reverse=True)
+    if not tardy or tardy[0][0] == 0:
+        return destroy_random(state, k, rng)   # 지각 없으면 무작위로
+    seed = tardy[0][1]
+    sp = state.placed[seed]
+    R = blocks[seed]["release_time"]
+    # 같은 베이에서, 씨앗이 일찍 있고 싶은 창 [R, exit) 와 시간 겹치는 블록들(자리 점유 후보)
+    conflict = [bid for bid, pb in state.placed.items()
+                if bid != seed and pb.bay_id == sp.bay_id
+                and pb.entry < sp.exit and R < pb.exit]
+    rng.shuffle(conflict)
+    chosen = [seed] + conflict[:max(0, k - 1)]
+    for bid in chosen:
+        C.remove_block(state, bid)
+    return chosen
+
+
+DESTROY_OPS = [destroy_worst_tardiness, destroy_random, destroy_related,
+               destroy_tardy_cluster]
 
 
 # ---------------------------------------------------------------------------
@@ -119,14 +143,25 @@ def repair(state: C.State, removed: list, rng: random.Random,
 # 메인 LNS 루프
 # ---------------------------------------------------------------------------
 def lns(prob_info: dict, timelimit: float = 60.0, seed: int = 12345,
-        verbose: bool = False) -> dict:
+        verbose: bool = False, force_fast: bool = False) -> dict:
     t0 = time.perf_counter()
     safety = min(3.0, 0.05 * timelimit)
     deadline = t0 + max(1.0, timelimit - safety)
 
-    # --- 시작점: 그리디 구성 (시간의 일부만 사용) ---
-    build_deadline = t0 + min(deadline - t0, max(2.0, 0.4 * (deadline - t0)))
-    current = C.build_state(prob_info, build_deadline, verbose)
+    # --- 시작점: 그리디 구성 ---
+    # 폴리곤(고밀도)으로 풀되, 예산의 40%를 넘기면 남은 블록만 AABB 고속으로 전환.
+    # 보통 인스턴스(P4~P6 포함)는 그 전에 끝나 폴리곤 품질 그대로. 거대 인스턴스만 폴백.
+    # force_fast=True 면 처음부터 AABB(실험/거대인스턴스용).
+    # 전환점 70%: 폴리곤 구성이 거의 항상 먼저 끝나 순수 폴리곤 출발점을 보장.
+    # (정말 거대해 폴리곤이 못 끝나는 경우에만 AABB 폴백 -> −1 방지.)
+    fast_switch = t0 if force_fast else t0 + max(2.0, 0.7 * (deadline - t0))
+    current = C.build_state(prob_info, deadline=deadline, verbose=verbose,
+                            fast_switch=fast_switch)
+    # 재삽입(repair) 엔진: 구성은 폴리곤(고밀도)로 끝냈고, LNS 반복은 고속 격자로 전환한다.
+    # -> 밀도 높은 출발점 + 수천 번의 빠른 LNS 반복. 최선해 보관이라 절대 나빠지지 않음.
+    # 단, 거대 인스턴스 폴백('aabb')이 걸렸으면 그대로 aabb 유지.
+    if current.place_mode == "poly":
+        current.place_mode = "grid"
     best = C.clone_state(current)
     best_obj = C.objective(current)[0]
     cur_obj = best_obj

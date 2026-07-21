@@ -30,12 +30,15 @@ import math
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
+import numpy as np
+
 from utils import Block, Bay
 
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, box as _shp_box
 from shapely.ops import unary_union
 from shapely.affinity import translate as _shp_translate
 from shapely.prepared import prep as _shp_prep
+from shapely import area as _shp_area, intersection as _shp_inter
 
 # 면적 겹침을 '충돌'로 볼 최소 임계값. 변(edge)만 닿는 건 collision-free 이므로
 # intersection.area > EPS_AREA 일 때만 충돌로 본다.
@@ -134,6 +137,7 @@ def clear_cache() -> None:
     """인스턴스가 바뀔 때 호출(보통 불필요 — 인스턴스는 실행 중 불변)."""
     _GEOM_CACHE.clear()
     _AREA_CACHE.clear()
+    _MASK_CACHE.clear()
 
 
 def _orient_geom(block_id: int, instance: dict, orient_idx: int) -> Optional[_OrientGeom]:
@@ -193,6 +197,99 @@ def _int_refs(edges: list[float], local_min: float,
 # ---------------------------------------------------------------------------
 # 핵심: 배치 찾기
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 격자(래스터) 배치 엔진 — 보수적 래스터화 + numpy bottom-left
+#   footprint 가 닿는 모든 1단위 셀을 마스크로 -> 격자 비중첩이면 footprint 비중첩 보장(feasible).
+#   폴리곤을 매번 옮겨 교차하는 대신 numpy 불리언 연산 -> 훨씬 빠르고, 전수 BL 로 더 빽빽.
+# ---------------------------------------------------------------------------
+_MASK_CACHE: dict = {}
+
+
+def block_mask(block_id: int, instance: dict, orient_idx: int):
+    """(mask[h,w] bool, ox, oy) 반환. ref (0,0) 기준 셀 (i,j) 의 월드 좌하단 = (ox+i, oy+j)."""
+    key = (id(instance), block_id, orient_idx)
+    cached = _MASK_CACHE.get(key, 0)
+    if cached != 0:
+        return cached
+    og = _orient_geom(block_id, instance, orient_idx)
+    if og is None:
+        _MASK_CACHE[key] = None
+        return None
+    ox = math.floor(og.lx0); oy = math.floor(og.ly0)
+    w = int(math.ceil(og.lx1)) - ox
+    h = int(math.ceil(og.ly1)) - oy
+    if w <= 0 or h <= 0:
+        _MASK_CACHE[key] = None
+        return None
+    cells = np.empty(h * w, dtype=object)
+    k = 0
+    for j in range(h):
+        for i in range(w):
+            cells[k] = _shp_box(ox + i, oy + j, ox + i + 1, oy + j + 1); k += 1
+    mask = (_shp_area(_shp_inter(cells, og.base_fp)) > EPS_AREA).reshape(h, w)
+    res = (mask, ox, oy)
+    _MASK_CACHE[key] = res
+    return res
+
+
+def find_placement_grid(bay: Bay,
+                        block_id: int,
+                        instance: dict,
+                        obstacles: list,
+                        orient_indices: Optional[Iterable[int]] = None
+                        ) -> Optional[Placement]:
+    """격자 bottom-left 배치. 폴리곤 경로보다 빠르고, 전수 BL 로 더 빽빽. 항상 feasible."""
+    W = int(round(bay.width)); H = int(round(bay.height))
+    if W <= 0 or H <= 0:
+        return None
+    if orient_indices is None:
+        orient_indices = range(len(instance["blocks"][block_id]["shape"]))
+
+    occ = np.zeros((H, W), dtype=bool)
+    for o in obstacles:
+        b = o.block
+        om = block_mask(b.block_id, instance, b.orient_idx)
+        if om is None:
+            continue
+        m, ox, oy = om
+        gx = int(round(b.x)) + ox; gy = int(round(b.y)) + oy
+        mh, mw = m.shape
+        x0 = max(0, gx); y0 = max(0, gy)
+        x1 = min(W, gx + mw); y1 = min(H, gy + mh)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        occ[y0:y1, x0:x1] |= m[y0 - gy:y1 - gy, x0 - gx:x1 - gx]
+
+    best = None
+    for oi in orient_indices:
+        bm = block_mask(block_id, instance, oi)
+        if bm is None:
+            continue
+        m, mox, moy = bm
+        mh, mw = m.shape
+        if mw > W or mh > H:
+            continue
+        placed = None
+        for gy0 in range(0, H - mh + 1):          # bottom-left: y 먼저
+            band = occ[gy0:gy0 + mh, :]
+            for gx0 in range(0, W - mw + 1):
+                if not (band[:, gx0:gx0 + mw] & m).any():
+                    placed = (gx0, gy0)
+                    break
+            if placed:
+                break
+        if placed:
+            gx0, gy0 = placed
+            og = _orient_geom(block_id, instance, oi)
+            x = gx0 - mox; y = gy0 - moy
+            key = (gy0 + mh, gx0)
+            if best is None or key < best[0]:
+                blk = Block.from_instance(block_id, instance, x=x, y=y, orient_idx=oi)
+                best = (key, Placement(block_id=block_id, x=x, y=y, orient_idx=oi,
+                                       block=blk, top_y=y + og.ly1, right_x=x + og.lx1))
+    return best[1] if best else None
+
+
 def find_placement_aabb(bay: Bay,
                         block_id: int,
                         instance: dict,

@@ -52,7 +52,7 @@ class State:
     placed: dict                 # block_id -> PlacedBlock
     by_bay: list                 # bay_id -> list[PlacedBlock]
     load: list                   # bay_id -> 누적 workload
-    fast: bool = False           # True 면 AABB 고속 배치 경로 사용(대규모용)
+    place_mode: str = "poly"     # 'poly'(폴리곤) | 'grid'(격자) | 'aabb'(고속). 배치 엔진 선택.
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +98,12 @@ def _obstacles_at(placed: list, t: int, proc: int) -> list:
     return [pb.obstacle for pb in placed if pb.entry < end and t < pb.exit]
 
 
-def _earliest_in_bay(bay, bid, instance, placed, release, proc, deadline, fast=False):
-    place = P.find_placement_aabb if fast else P.find_placement
+_PLACE_FN = {"poly": "find_placement", "grid": "find_placement_grid",
+             "aabb": "find_placement_aabb"}
+
+
+def _earliest_in_bay(bay, bid, instance, placed, release, proc, deadline, mode="poly"):
+    place = getattr(P, _PLACE_FN.get(mode, "find_placement"))
     times = _candidate_times(placed, release, proc)
     bay_area = bay.width * bay.height
     blk_area = P.block_footprint_area(bid, instance)
@@ -126,8 +130,8 @@ def _earliest_in_bay(bay, bid, instance, placed, release, proc, deadline, fast=F
 # ---------------------------------------------------------------------------
 # 상태 API
 # ---------------------------------------------------------------------------
-# 이 블록 수를 넘으면 AABB 고속 배치 경로 사용(폴리곤 경로가 O(n²)로 느려지는 구간).
-FAST_THRESHOLD = 100
+# 시간 기반 폴백: 구성이 이 시각을 넘기면 남은 블록만 AABB 고속으로 전환.
+# (블록 수 기준 전환은 실제 P4~P6에서 역효과였음 — 폴리곤이 감당되는 규모였다.)
 
 
 def new_state(prob_info: dict) -> State:
@@ -138,7 +142,7 @@ def new_state(prob_info: dict) -> State:
         w1=w.get("w1", 1.0), w2=w.get("w2", 0.0), w3=w.get("w3", 0.0),
         u=_bay_weights(bays),
         placed={}, by_bay=[[] for _ in bays], load=[0.0] * len(bays),
-        fast=(len(prob_info["blocks"]) > FAST_THRESHOLD),
+        place_mode="poly",
     )
 
 
@@ -148,7 +152,7 @@ def clone_state(s: State) -> State:
         placed=dict(s.placed),
         by_bay=[lst[:] for lst in s.by_bay],
         load=s.load[:],
-        fast=s.fast,
+        place_mode=s.place_mode,
     )
 
 
@@ -162,7 +166,7 @@ def insert_block(state: State, bid: int, deadline=None) -> bool:
     best = None  # (score, bay_id, entry, placement)
     for j, bay in enumerate(state.bays):
         res = _earliest_in_bay(bay, bid, state.instance, state.by_bay[j],
-                               R, P_, deadline, state.fast)
+                               R, P_, deadline, state.place_mode)
         if res is None:
             continue
         entry, pl = res
@@ -248,10 +252,20 @@ def construct(prob_info: dict, timelimit: float = 60.0,
     return build_operations(state)
 
 
-def build_state(prob_info: dict, deadline=None, verbose: bool = False) -> State:
-    """그리디로 채운 State 를 반환(LNS 의 시작점으로도 사용)."""
+def build_state(prob_info: dict, deadline=None, verbose: bool = False,
+                fast_switch=None) -> State:
+    """
+    그리디로 채운 State 를 반환(LNS 의 시작점으로도 사용).
+    fast_switch 시각을 넘기면, 남은 블록만 AABB 고속 배치로 전환(거대 인스턴스 안전장치).
+    폴리곤이 예산 안에 끝나는 보통 인스턴스에선 전환이 일어나지 않아 고밀도 유지.
+    """
     state = new_state(prob_info)
     for bid in order_blocks_edd(prob_info["blocks"]):
+        if (fast_switch is not None and state.place_mode == "poly"
+                and time.perf_counter() > fast_switch):
+            state.place_mode = "aabb"
+            if verbose:
+                print(f"[constructor] 시간 초과 조짐 -> block {bid}부터 AABB 고속 배치")
         ok = insert_block(state, bid, deadline)
         if not ok and verbose:
             print(f"[constructor] WARNING: block {bid} 배치 불가")
