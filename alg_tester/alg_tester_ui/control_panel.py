@@ -251,13 +251,15 @@ class ControlPanel(QWidget):
 
     def _apply_alg_folder(self, folder: str):
         myalg = pathlib.Path(folder) / "myalgorithm.py"
-        if not myalg.exists():
-            self._alg_info.setText("myalgorithm.py not found!")
-            self._alg_info.setStyleSheet("color:#dc2626; font-size:10px;")
-            return
-        self._alg_folder = folder
         self.alg_path.setText(pathlib.Path(folder).name)
         self.alg_path.setToolTip(folder)
+        if not myalg.exists():
+            self._alg_folder = ""
+            self._alg_info.setText("myalgorithm.py not found!")
+            self._alg_info.setStyleSheet("color:#dc2626; font-size:10px;")
+            self._refresh_run_btn()
+            return
+        self._alg_folder = folder
         self._alg_info.setText(folder)
         self._alg_info.setStyleSheet("color:#16a34a; font-size:10px;")
         self._refresh_run_btn()
