@@ -727,6 +727,15 @@ class BayCanvas(QWidget):
         self._bay_px_w: int = 0
         self._bay_px_h: int = 0
 
+        # Segments/preview are recomputed lazily in paintEvent instead of eagerly
+        # in the mouse handlers -- cut-line dragging and block-drag hover can fire
+        # many mouseMoveEvents per actual repaint, and Qt already coalesces
+        # multiple update() calls into a single paintEvent, so doing the Shapely
+        # work there instead caps it at one recompute per visible frame.
+        self._segments_dirty: bool = True
+        self._preview_dirty: bool = False
+        self._preview_pending: Optional[tuple] = None  # (blk, nx, ny)
+
         self.setMouseTracking(True)
         self._update_size()
 
@@ -937,6 +946,8 @@ class BayCanvas(QWidget):
         super().mouseReleaseEvent(ev)
 
     def paintEvent(self, ev):
+        self._ensure_segments_fresh()
+        self._ensure_preview_fresh()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor("#f0f4f8"))
@@ -1578,7 +1589,23 @@ class BayCanvas(QWidget):
         self._refresh_segments()
 
     def set_drag_preview(self, blk: "BlockItem", nx: float, ny: float):
-        """Preview the cross-section at the drop position while dragging a block into this bay."""
+        """Preview the cross-section at the drop position while dragging a block into this bay.
+
+        Only records the pending ghost position here -- the actual Shapely
+        cross-section is computed lazily in paintEvent (see _ensure_preview_fresh).
+        This is called on every mouseMoveEvent while hovering a bay during a drag,
+        which fires far more often than the widget actually repaints; deferring
+        the work caps it at one recompute per visible frame instead of one per
+        raw mouse-move event.
+        """
+        self._preview_pending = (blk, nx, ny)
+        self._preview_dirty = True
+        self.update()
+
+    def _ensure_preview_fresh(self):
+        if not self._preview_dirty:
+            return
+        blk, nx, ny = self._preview_pending
         import copy as _copy
         ghost = _copy.copy(blk)
         bb = ghost.anchored_bb()
@@ -1588,10 +1615,12 @@ class BayCanvas(QWidget):
             [ghost], self.bay_w, self.bay_h, 'x', self._cut_x_pos, self.visible_layers)
         self._preview_y_segs = _compute_cross_section(
             [ghost], self.bay_w, self.bay_h, 'y', self._cut_y_pos, self.visible_layers)
-        self.update()
+        self._preview_dirty = False
 
     def clear_drag_preview(self):
         """Clear drag preview."""
+        self._preview_pending = None
+        self._preview_dirty = False
         if self._preview_x_segs or self._preview_y_segs:
             self._preview_x_segs = []
             self._preview_y_segs = []
@@ -1631,7 +1660,15 @@ class BayCanvas(QWidget):
         return abs(py - cpy) <= 6
 
     def _refresh_segments(self):
-        """Update cross-section data on block change or cut line move."""
+        """Mark cross-section data dirty on block change or cut line move.
+
+        The actual (Shapely-based) recompute happens lazily in paintEvent via
+        _ensure_segments_fresh(), not here. This matters most for cut-line
+        dragging: mouseMoveEvent calls this on every raw mouse move, which can
+        fire many times per repaint, but Qt already coalesces repeated update()
+        calls into a single paintEvent -- so deferring the work caps it at one
+        recompute per visible frame instead of one per input event.
+        """
         if self.blocks:
             n = max((len(b.anchored_layers()) for b in self.blocks), default=1)
             if self.visible_layers:
@@ -1639,6 +1676,13 @@ class BayCanvas(QWidget):
             self._n_layers = max(n, 1)
         else:
             self._n_layers = 1
+        self._segments_dirty = True
+        self._update_size()
+        self.update()
+
+    def _ensure_segments_fresh(self):
+        if not self._segments_dirty:
+            return
         self._cached_x_segments = _compute_cross_section(
             self.blocks, self.bay_w, self.bay_h, 'x', self._cut_x_pos, self.visible_layers)
         self._cached_y_segments = _compute_cross_section(
@@ -1647,8 +1691,7 @@ class BayCanvas(QWidget):
             self._cached_collision_results, self.bay_w, self.bay_h, 'x', self._cut_x_pos)
         self._cached_y_collision_segs = _compute_collision_cross_section(
             self._cached_collision_results, self.bay_w, self.bay_h, 'y', self._cut_y_pos)
-        self._update_size()
-        self.update()
+        self._segments_dirty = False
 
 
 # -----------------------------------------------------------------------------
