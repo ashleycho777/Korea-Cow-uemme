@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QPointF, QRectF, QPoint, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QPolygonF,
-    QFont, QFontMetricsF, QCursor, QPainterPath,
+    QFont, QFontMetricsF, QCursor, QPainterPath, QTransform,
 )
 from shapely.geometry import (Point as ShapelyPoint, Polygon as ShapelyPolygon,
                                LineString as ShapelyLine)
@@ -665,6 +665,11 @@ class BayCanvas(QWidget):
         self._press_grab_offset: QPointF = QPointF(0.0, 0.0)
         self._drag_started_flag = False
         self._cached_collision_results: list[CollisionResult] = []
+        # Cache of occlusion polygons (bay-space, keyed by (blk_id, li_threshold)) used
+        # to fade covered outlines -- invalidated only when block geometry actually
+        # changes (see mark_dirty / mark_dirty_for_block / mark_after_removal), not on
+        # every repaint (cut-line drag, zoom, tooltip hover all leave it valid).
+        self._occlusion_cache: dict = {}
 
         # solution viewer: set of block ids being exited (crane in progress)
         # and the id of the block just entered (-1 = none)
@@ -713,6 +718,37 @@ class BayCanvas(QWidget):
     def _to_bay(self, px: float, py: float):
         return ((px - self.PAD) / self._scale,
                 (self._bay_px_h - self.PAD - py) / self._scale)
+
+    def _covering_path_for(self, blk_id: int, li_threshold: int) -> QPainterPath:
+        """Return QPainterPath (pixel space) of areas from other blocks (excluding
+        blk_id) with layer index > li_threshold -- the 'occluding area' used to fade
+        covered outlines.
+
+        The polygon union is computed once in bay-space and cached per (blk_id,
+        li_threshold); it's cleared only by mark_dirty/mark_dirty_for_block/
+        mark_after_removal, i.e. when block positions/rotations/visibility actually
+        change. Repaints that don't move any block (cut-line drag, zoom, tooltip
+        hover) reuse the cached union and just re-map it through the current
+        pixel transform, avoiding repeated QPainterPath.united() calls.
+        """
+        key = (blk_id, li_threshold)
+        world_path = self._occlusion_cache.get(key)
+        if world_path is None:
+            world_path = QPainterPath()
+            for other_blk in self.blocks:
+                if other_blk.id == blk_id:
+                    continue
+                for j, layer_verts in enumerate(other_blk.layers_at_pos()):
+                    if self.visible_layers is not None and j not in self.visible_layers:
+                        continue
+                    if j > li_threshold and layer_verts:
+                        p = QPainterPath()
+                        p.addPolygon(QPolygonF([QPointF(x, y) for x, y in layer_verts]))
+                        world_path = world_path.united(p)
+            self._occlusion_cache[key] = world_path
+        transform = QTransform(self._scale, 0, 0, -self._scale,
+                               self.PAD, self._bay_px_h - self.PAD)
+        return transform.map(world_path)
 
     def _block_at(self, bx, by) -> Optional[BlockItem]:
         for blk in reversed(self.blocks):
@@ -947,20 +983,6 @@ class BayCanvas(QWidget):
         pen_obstruct_dash.setStyle(Qt.PenStyle.DashLine)
         pen_obstruct_dash.setDashPattern([4, 3])
 
-        def _covering_path_for(blk_id, li_threshold):
-            """Return QPainterPath of pixel areas from other blocks (excluding blk_id)
-            with layer index > li_threshold. This path represents the 'occluding area'."""
-            cp = QPainterPath()
-            for other_blk, other_origin, other_vis, other_layers in blk_entries:
-                if other_blk.id == blk_id:
-                    continue
-                for j in other_vis:
-                    if j > li_threshold and other_layers[j]:
-                        p = QPainterPath()
-                        p.addPolygon(_to_qpoly(other_origin, other_layers[j], self._scale))
-                        cp = cp.united(p)
-            return cp
-
         painter.setBrush(Qt.BrushStyle.NoBrush)
         for blk, origin, vis_indices, all_layers in blk_entries:
             is_exiting    = blk.id in self.exiting_block_ids
@@ -992,7 +1014,7 @@ class BayCanvas(QWidget):
                     painter.drawPolygon(poly)
                     continue
 
-                covering = _covering_path_for(blk.id, li)
+                covering = self._covering_path_for(blk.id, li)
                 if covering.isEmpty():
                     painter.setClipping(False)
                     painter.setPen(pen_dash_normal)
@@ -1060,7 +1082,7 @@ class BayCanvas(QWidget):
 
             # Normal block: faint rendering of occluded area via clip separation
             top_li = vis_indices[-1]
-            covering_outer = _covering_path_for(blk.id, top_li - 1)
+            covering_outer = self._covering_path_for(blk.id, top_li - 1)
             for op in outer_polys:
                 if covering_outer.isEmpty():
                     painter.setClipping(False)
@@ -1459,6 +1481,7 @@ class BayCanvas(QWidget):
 
     def mark_dirty(self):
         """Full recalculation -- used for layer toggle, bulk block changes, etc."""
+        self._occlusion_cache.clear()
         bay = UtilsBay(width=int(self.bay_w), height=int(self.bay_h))
         # Blocks being EXITed are in crane-lifting state and excluded from collision checks
         util_blocks = [
@@ -1474,6 +1497,7 @@ class BayCanvas(QWidget):
 
     def mark_after_removal(self, removed_blk_id: int):
         """Called after a block is removed from the bay -- O(1) without Shapely."""
+        self._occlusion_cache.clear()
         self._cached_collision_results = [
             r for r in self._cached_collision_results
             if r.block_a.block_id != removed_blk_id
@@ -1484,6 +1508,7 @@ class BayCanvas(QWidget):
 
     def mark_dirty_for_block(self, changed_blk_id: int):
         """Called after a block's position/rotation changes -- recomputes only pairs involving this block O(N)."""
+        self._occlusion_cache.clear()
         # 1) Remove entries involving this block from previous results
         self._cached_collision_results = [
             r for r in self._cached_collision_results
