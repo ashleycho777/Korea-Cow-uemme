@@ -59,6 +59,27 @@ def _bay_color_dark(bay_id: int, alpha: int = 255) -> QColor:
     return QColor.fromHsv(hue, 220, 150, alpha)
 
 
+_font_metrics_cache: dict = {}
+
+
+def _cached_font_and_metrics(family: str, point_size: int, bold: bool = False):
+    """Return a (QFont, QFontMetricsF) pair, cached by (family, point_size, bold).
+
+    _draw_row/_draw_axis used to construct a fresh QFont + QFontMetricsF for
+    every row on every repaint (and rows repaint often, e.g. on hover); since
+    only a handful of distinct sizes are ever used, caching turns that into a
+    dict lookup after the first use of each size.
+    """
+    key = (family, point_size, bold)
+    entry = _font_metrics_cache.get(key)
+    if entry is None:
+        weight = QFont.Weight.Bold if bold else QFont.Weight.Normal
+        font = QFont(family, point_size, weight)
+        entry = (font, QFontMetricsF(font))
+        _font_metrics_cache[key] = entry
+    return entry
+
+
 # -----------------------------------------------------------------------------
 # GanttCanvas -- the actual drawing widget (inside a scroll area)
 # -----------------------------------------------------------------------------
@@ -159,9 +180,8 @@ class GanttCanvas(QWidget):
                 tick_step = ni
                 break
 
-        font = QFont("Helvetica", 9)
+        font, fm = _cached_font_and_metrics("Helvetica", 9)
         p.setFont(font)
-        fm = QFontMetricsF(font)
         pen_tick = QPen(QColor("#94a3b8"), 1)
         pen_label = QPen(QColor("#334155"), 1)
 
@@ -284,12 +304,11 @@ class GanttCanvas(QWidget):
 
         # -- Row label (left column): block id + bay id ------------------------
         p.fillRect(0, int(y), _LABEL_W, _ROW_H, bg)
-        font_b = QFont("Helvetica", 9, QFont.Weight.Bold)
-        font_s = QFont("Helvetica", 8)
+        font_b, fm_b = _cached_font_and_metrics("Helvetica", 9, bold=True)
+        font_s, fm_s = _cached_font_and_metrics("Helvetica", 8)
         p.setFont(font_b)
         p.setPen(QPen(QColor("#1e293b"), 1))
         lbl_block = f"B{block_id}"
-        fm_b = QFontMetricsF(font_b)
         lbl_x = _LABEL_W - fm_b.horizontalAdvance(lbl_block) - 6
         p.drawText(QPointF(lbl_x, y + _ROW_H / 2 - 1), lbl_block)
 
@@ -297,7 +316,6 @@ class GanttCanvas(QWidget):
         p.setFont(font_s)
         p.setPen(QPen(QColor("#64748b"), 1))
         lbl_bay = f"bay{bay_id + 1}"
-        fm_s = QFontMetricsF(font_s)
         bay_x = _LABEL_W - fm_s.horizontalAdvance(lbl_bay) - 6
         p.drawText(QPointF(bay_x, y + _ROW_H / 2 + fm_s.ascent() - 1), lbl_bay)
 
@@ -308,10 +326,9 @@ class GanttCanvas(QWidget):
         # -- Tardiness label inside / beside bar ------------------------------
         if tardy > 1e-6:
             t_str = f"T={tardy:.0f}"
-            font_t = QFont("Helvetica", 8)
+            font_t, ft = _cached_font_and_metrics("Helvetica", 8)
             p.setFont(font_t)
             p.setPen(QPen(QColor("#7f1d1d"), 1))
-            ft = QFontMetricsF(font_t)
             tx = int(x1) + 3
             ty = int(y + _ROW_H / 2 + ft.ascent() / 2 - 1)
             if tx + ft.horizontalAdvance(t_str) < w:
