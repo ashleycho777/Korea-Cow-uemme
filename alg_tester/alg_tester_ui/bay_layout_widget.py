@@ -83,6 +83,46 @@ def _layer_gray(layer_idx: int) -> int:
     return min(_LAYER_GRAY_MAX, _LAYER_GRAY_BASE + layer_idx * _LAYER_GRAY_STEP)
 
 
+_dpi_scale_cache: Optional[float] = None
+
+
+def _get_dpi_scale() -> float:
+    """72-DPI-normalized scale factor (macOS baseline) for the primary screen.
+
+    Cached after the first call -- screen DPI doesn't change during the app's
+    lifetime, so there's no need to query QApplication.primaryScreen() and
+    redo this division on every repaint / every block label.
+    """
+    global _dpi_scale_cache
+    if _dpi_scale_cache is None:
+        scr = QApplication.primaryScreen()
+        _dpi_scale_cache = 72.0 / (scr.logicalDotsPerInch() if scr else 72.0)
+    return _dpi_scale_cache
+
+
+_font_metrics_cache: dict = {}
+
+
+def _cached_font_and_metrics(family: str, point_size: float, bold: bool = False):
+    """Return a (QFont, QFontMetricsF) pair, cached by (family, point_size, bold).
+
+    Point sizes only take a handful of distinct values in practice (they depend
+    on the fixed DPI scale and on the discrete bay/panel zoom steps), so this
+    turns what used to be a fresh QFont + QFontMetricsF construction per block
+    per repaint into a dict lookup after the first use of each size.
+    """
+    key = (family, round(point_size, 2), bold)
+    entry = _font_metrics_cache.get(key)
+    if entry is None:
+        font = QFont(family)
+        if bold:
+            font.setWeight(QFont.Weight.Bold)
+        font.setPointSizeF(point_size)
+        entry = (font, QFontMetricsF(font))
+        _font_metrics_cache[key] = entry
+    return entry
+
+
 def _point_in_poly(px: float, py: float, verts: list) -> bool:
     n = len(verts)
     inside = False
@@ -346,13 +386,9 @@ def _draw_block_at(painter, blk, origin_px, scale, visible_layers,
         center = to_px(cx, cy)
         id_part     = f"B{blk.display_id}"
         orient_part = f"({blk.orientation_index})"
-        _scr = QApplication.primaryScreen()
-        _dpi_s = 72.0 / (_scr.logicalDotsPerInch() if _scr else 72.0)
-        font = QFont("Arial")
-        font.setWeight(QFont.Weight.Bold)
-        font.setPointSizeF(max(8, int(scale * 1.4)) * _dpi_s)
+        font, fm = _cached_font_and_metrics(
+            "Arial", max(8, int(scale * 1.4)) * _get_dpi_scale(), bold=True)
         painter.setFont(font)
-        fm = QFontMetricsF(font)
         id_w     = fm.horizontalAdvance(id_part)
         orient_w = fm.horizontalAdvance(orient_part)
         total_w  = id_w + orient_w
@@ -465,24 +501,15 @@ class BlockPanelCanvas(QWidget):
         CLR_ORG   = QColor("#fb923c")   # orange-400 (preference)
 
         # Normalize to 72 DPI (macOS baseline) -> renders at the same pixel size on Windows (96 DPI) etc.
-        _screen = QApplication.primaryScreen()
-        _dpi    = _screen.logicalDotsPerInch() if _screen else 72.0
-        _s      = 72.0 / _dpi  # macOS:1.0  Windows 96dpi:0.75
-
-        FONT_ID  = QFont("Arial")
-        FONT_ID.setWeight(QFont.Weight.Bold)
-        FONT_ID.setPointSizeF(10 * _s)
-        FONT_LBL = QFont("Arial")
-        FONT_LBL.setPointSizeF(9 * _s)
-        FONT_VAL = QFont("Arial")
-        FONT_VAL.setWeight(QFont.Weight.Bold)
-        FONT_VAL.setPointSizeF(10 * _s)
+        _s = _get_dpi_scale()
+        FONT_ID,  fm_id  = _cached_font_and_metrics("Arial", 10 * _s, bold=True)
+        FONT_LBL, fm_lbl = _cached_font_and_metrics("Arial", 9 * _s)
+        FONT_VAL, fm_val = _cached_font_and_metrics("Arial", 10 * _s, bold=True)
 
         pad = 5.0
         iw  = PANEL_INFO_W - 2
 
         # -- Block ID header ------------------------------------------------
-        fm_id = QFontMetricsF(FONT_ID)
         painter.setFont(FONT_ID)
         painter.setPen(QPen(CLR_ID))
         id_text = f"B{blk.display_id}"
@@ -505,8 +532,6 @@ class BlockPanelCanvas(QWidget):
             ("Rots", str(n_orient),      CLR_AMB),
         ]
 
-        fm_lbl = QFontMetricsF(FONT_LBL)
-        fm_val = QFontMetricsF(FONT_VAL)
         row_h  = max(fm_lbl.height(), fm_val.height()) + 1
         baseline_off = max(fm_lbl.ascent(), fm_val.ascent())
 
@@ -935,11 +960,7 @@ class BayCanvas(QWidget):
         painter.drawText(QPointF(self.PAD + 4, self.PAD - 3), f"Bay {self.bay_id}")
 
         # -- Display bay dimensions in center (two lines) --------------------
-        _scr = QApplication.primaryScreen()
-        _dpi_s = 72.0 / (_scr.logicalDotsPerInch() if _scr else 72.0)
-        size_font = QFont("Arial")
-        size_font.setPointSizeF(40 * _dpi_s)
-        fm_size = QFontMetricsF(size_font)
+        size_font, fm_size = _cached_font_and_metrics("Arial", 40 * _get_dpi_scale())
         line1 = f"Bay {self.bay_id}"
         line2 = f"{int(self.bay_w)} x {int(self.bay_h)}"
         line_gap = fm_size.height() * 0.1
@@ -1252,13 +1273,9 @@ class BayCanvas(QWidget):
                 orient_tag  = f"({blk.orientation_index})"
                 label_color = QColor("#1e293b")
                 bg_color    = QColor(255, 255, 255, 190)
-            _scr = QApplication.primaryScreen()
-            _dpi_s = 72.0 / (_scr.logicalDotsPerInch() if _scr else 72.0)
-            font = QFont("Arial")
-            font.setWeight(QFont.Weight.Bold)
-            font.setPointSizeF(max(7, int(self._scale * 1.4)) * _dpi_s)
+            font, fm = _cached_font_and_metrics(
+                "Arial", max(7, int(self._scale * 1.4)) * _get_dpi_scale(), bold=True)
             painter.setFont(font)
-            fm = QFontMetricsF(font)
             lines = label.split("\n")
             lh = fm.height()
             th = lh * len(lines)
