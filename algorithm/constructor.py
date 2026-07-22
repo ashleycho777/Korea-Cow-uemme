@@ -102,12 +102,16 @@ _PLACE_FN = {"poly": "find_placement", "grid": "find_placement_grid",
              "aabb": "find_placement_aabb"}
 
 
-def _earliest_in_bay(bay, bid, instance, placed, release, proc, deadline, mode="poly"):
+def _earliest_in_bay(bay, bid, instance, placed, release, proc, deadline, mode="poly",
+                     cut_time=None):
+    """cut_time: 이 시각 이상이면 어차피 현재 최선보다 나빠지므로 스캔 중단(가지치기)."""
     place = getattr(P, _PLACE_FN.get(mode, "find_placement"))
     times = _candidate_times(placed, release, proc)
     bay_area = bay.width * bay.height
     blk_area = P.block_footprint_area(bid, instance)
     for t in times:
+        if cut_time is not None and t > cut_time:
+            return None
         if deadline is not None and time.perf_counter() > deadline:
             # 시간 초과: '빈-베이 보장 시각'(후보의 최대값)만 시도.
             # 이 시각엔 장애물이 없으므로, 블록이 이 베이에 들어가면 반드시 배치된다.
@@ -163,19 +167,38 @@ def insert_block(state: State, bid: int, deadline=None) -> bool:
     P_ = bd["processing_time"]; L = bd["workload"]
     prefs = bd["bay_preferences"]; s_max = max(prefs)
 
+    # --- 베이별 하한(가장 이른 진입=R 가정) 계산 후 유망한 순서로 탐색 ---
+    n_bay = len(state.bays)
+    lb = []
+    for j in range(n_bay):
+        tard0 = max(0, R + P_ - D)
+        pref_pen = s_max - prefs[j]
+        # 실제 채점식과 동일한 Z2(가중부하 max-min)를 이 베이에 넣었을 때 값으로 계산
+        wl = [state.u[k] * state.load[k] for k in range(n_bay)]
+        wl[j] = state.u[j] * (state.load[j] + L)
+        bal = (max(wl) - min(wl)) if n_bay >= 2 else 0.0
+        lb.append((state.w1 * tard0 + state.w2 * bal + state.w3 * pref_pen, j, bal, pref_pen))
+    lb.sort()
+
     best = None  # (score, bay_id, entry, placement)
-    for j, bay in enumerate(state.bays):
+    for lo, j, bal, pref_pen in lb:
+        if best is not None and lo >= best[0]:
+            break                      # 남은 베이는 하한이 이미 최선 이상 -> 전부 생략
+        bay = state.bays[j]
+        # 이 베이에서 최선을 넘지 않으려면 진입시각이 cut 이하여야 함
+        cut_time = None
+        if best is not None and state.w1 > 0:
+            slack = (best[0] - state.w2 * bal - state.w3 * pref_pen) / state.w1
+            cut_time = D - P_ + slack
+            if cut_time < R:
+                continue
         res = _earliest_in_bay(bay, bid, state.instance, state.by_bay[j],
-                               R, P_, deadline, state.place_mode)
+                               R, P_, deadline, state.place_mode, cut_time)
         if res is None:
             continue
         entry, pl = res
         exit_ = entry + P_
         tard = max(0, exit_ - D)
-        pref_pen = s_max - prefs[j]
-        new_load = state.load[j] + L
-        bal = max((abs(state.u[j] * new_load - state.u[k] * state.load[k])
-                   for k in range(len(state.bays)) if k != j), default=0.0)
         score = (state.w1 * tard + state.w2 * bal + state.w3 * pref_pen
                  + 1e-4 * pl.top_y)
         if best is None or score < best[0]:

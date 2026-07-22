@@ -115,15 +115,101 @@ def destroy_tardy_cluster(state: C.State, k: int, rng: random.Random) -> list:
     return chosen
 
 
+
+def destroy_worst_preference(state: C.State, k: int, rng: random.Random) -> list:
+    """선호도 페널티(Z3)가 큰 블록 우선 제거 -> 선호 베이로 옮길 기회를 준다.
+    Z1=0 인 인스턴스에서는 Z3 가 목적값의 대부분을 차지하므로 직접 겨냥한다."""
+    blocks = state.instance["blocks"]
+    scored = []
+    for bid, pb in state.placed.items():
+        prefs = blocks[bid]["bay_preferences"]
+        pen = max(prefs) - prefs[pb.bay_id]
+        if pen > 0:
+            scored.append((pen, bid))
+    if not scored:
+        return destroy_random(state, k, rng)
+    scored.sort(reverse=True)
+    # 상위 후보 풀에서 무작위 추출(다양화)
+    pool = [bid for _, bid in scored[:max(3 * k, 12)]]
+    rng.shuffle(pool)
+    chosen = pool[:k]
+    if len(chosen) < k:
+        rest = [b for b in state.placed if b not in chosen]
+        rng.shuffle(rest)
+        chosen += rest[:k - len(chosen)]
+    for bid in chosen:
+        C.remove_block(state, bid)
+    return chosen
+
+
+def destroy_bay_imbalance(state: C.State, k: int, rng: random.Random) -> list:
+    """가중 부하가 가장 큰 베이에서 블록을 빼내 부하 불균형(Z2)을 직접 줄인다."""
+    n = len(state.bays)
+    if n < 2:
+        return destroy_random(state, k, rng)
+    weighted = [state.u[j] * state.load[j] for j in range(n)]
+    heavy = max(range(n), key=lambda j: weighted[j])
+    cand = [bid for bid, pb in state.placed.items() if pb.bay_id == heavy]
+    if not cand:
+        return destroy_random(state, k, rng)
+    rng.shuffle(cand)
+    chosen = cand[:k]
+    if len(chosen) < k:
+        rest = [b for b in state.placed if b not in chosen]
+        rng.shuffle(rest)
+        chosen += rest[:k - len(chosen)]
+    for bid in chosen:
+        C.remove_block(state, bid)
+    return chosen
+
+
+
+def destroy_pref_cluster(state: C.State, k: int, rng: random.Random) -> list:
+    """선호 페널티가 큰 블록 1개를 고르고, 그 블록이 가고 싶은 베이에서 시간이 겹치는
+    점유 블록들을 함께 제거해 '자리를 터준다'. 대상 블록을 가장 먼저 재삽입한다.
+    (기존 연산자는 페널티 블록만 빼서 다시 같은 자리로 돌아가는 문제가 있었음)"""
+    blocks = state.instance["blocks"]
+    scored = []
+    for bid, pb in state.placed.items():
+        prefs = blocks[bid]["bay_preferences"]
+        pen = max(prefs) - prefs[pb.bay_id]
+        if pen > 0:
+            scored.append((pen, bid))
+    if not scored:
+        return destroy_random(state, k, rng)
+    scored.sort(reverse=True)
+    pool = [b for _, b in scored[:max(3 * k, 12)]]
+    target = rng.choice(pool)
+    tp = state.placed[target]
+    prefs = blocks[target]["bay_preferences"]
+    order = sorted(range(len(prefs)), key=lambda j: prefs[j], reverse=True)
+    j_star = order[0]
+    if j_star == tp.bay_id and len(order) > 1:
+        j_star = order[1]
+    R = blocks[target]["release_time"]
+    occupants = [bid for bid, pb in state.placed.items()
+                 if bid != target and pb.bay_id == j_star
+                 and pb.entry < tp.exit and R < pb.exit]
+    rng.shuffle(occupants)
+    chosen = [target] + occupants[:max(0, k - 1)]
+    for bid in chosen:
+        C.remove_block(state, bid)
+    return chosen
+
+
 DESTROY_OPS = [destroy_worst_tardiness, destroy_random, destroy_related,
-               destroy_tardy_cluster]
+               destroy_tardy_cluster, destroy_worst_preference,
+               destroy_bay_imbalance, destroy_pref_cluster]
+
+# 씨앗 블록을 먼저 재삽입해야 의미가 있는 연산자들(인덱스)
+TARGETED_IDX = {3, 6}
 
 
 # ---------------------------------------------------------------------------
 # Repair
 # ---------------------------------------------------------------------------
 def repair(state: C.State, removed: list, rng: random.Random,
-           deadline: float) -> None:
+           deadline: float, priority=None) -> None:
     blocks = state.instance["blocks"]
     mode = rng.random()
     if mode < 0.5:        # 여유(slack) 적은 순 — 지각 위험 큰 것 먼저
@@ -135,6 +221,8 @@ def repair(state: C.State, removed: list, rng: random.Random,
     else:                 # 무작위 (다양화)
         removed = removed[:]
         rng.shuffle(removed)
+    if priority is not None and priority in removed:
+        removed = [priority] + [b for b in removed if b != priority]
     for bid in removed:
         C.insert_block(state, bid, deadline)
 
@@ -169,9 +257,25 @@ def lns(prob_info: dict, timelimit: float = 60.0, seed: int = 12345,
     n = len(prob_info["blocks"])
     kmax = max(3, min(12, int(0.15 * n) + 2))
 
-    # 적응형 destroy 가중치
-    weights = [1.0] * len(DESTROY_OPS)
-    decay = 0.9
+    # 적응형 destroy 가중치 — 목적값 구성비(Z1:Z2:Z3)에 맞춰 초기화한다.
+    # 지각이 0인 인스턴스에서 지각용 연산자를 균등하게 돌리는 건 낭비이고,
+    # 반대로 지각 지배 인스턴스에서 선호도용 연산자를 돌리는 것도 낭비다.
+    _o = C.objective(current)
+    c1 = prob_info.get("weights", {}).get("w1", 1.0) * _o[1]
+    c2 = prob_info.get("weights", {}).get("w2", 1.0) * _o[2]
+    c3 = prob_info.get("weights", {}).get("w3", 1.0) * _o[3]
+    _tot = max(1e-9, c1 + c2 + c3)
+    f1, f2, f3 = c1 / _tot, c2 / _tot, c3 / _tot
+    weights = [
+        0.2 + 3.0 * f1,   # 0 worst_tardiness
+        0.6,              # 1 random        (다양화용, 항상 유지)
+        0.6,              # 2 related       (범용)
+        0.2 + 3.0 * f1,   # 3 tardy_cluster
+        0.2 + 3.0 * f3,   # 4 worst_preference
+        0.2 + 3.0 * f2,   # 5 bay_imbalance
+        0.2 + 3.0 * f3,   # 6 pref_cluster
+    ]
+    decay = 0.85
 
     iters = 0; accepts = 0; improves = 0
     if verbose:
@@ -187,7 +291,8 @@ def lns(prob_info: dict, timelimit: float = 60.0, seed: int = 12345,
         k = rng_k(weights, kmax)
         op_idx = roulette(weights)
         removed = DESTROY_OPS[op_idx](cand, k, _RNG)
-        repair(cand, removed, _RNG, deadline)
+        pri = removed[0] if (op_idx in TARGETED_IDX and removed) else None
+        repair(cand, removed, _RNG, deadline, pri)
         # 완전성 가드: 모든 블록이 배치된 해만 유효(미배정 해는 obj가 낮게 나와 오채택될 수 있음)
         if len(cand.placed) != n:
             continue
