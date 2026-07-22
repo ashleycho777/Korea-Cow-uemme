@@ -30,7 +30,8 @@ from PyQt6.QtGui import (
     QFont, QFontMetricsF, QCursor, QPainterPath, QTransform,
 )
 from shapely.geometry import (Point as ShapelyPoint, Polygon as ShapelyPolygon,
-                               LineString as ShapelyLine)
+                               LineString as ShapelyLine,
+                               MultiPolygon as ShapelyMultiPolygon)
 from shapely.ops import unary_union
 from utils import (
     Bay as UtilsBay,
@@ -670,6 +671,11 @@ class BayCanvas(QWidget):
         # changes (see mark_dirty / mark_dirty_for_block / mark_after_removal), not on
         # every repaint (cut-line drag, zoom, tooltip hover all leave it valid).
         self._occlusion_cache: dict = {}
+        # Cache of each block's own outer-boundary rings (union of its visible
+        # layers, in local/anchored coordinates) -- same invalidation rule as
+        # _occlusion_cache above, since the shape only depends on the block's own
+        # position/rotation/visible layers, not on scale or other blocks.
+        self._outer_union_cache: dict = {}
 
         # solution viewer: set of block ids being exited (crane in progress)
         # and the id of the block just entered (-1 = none)
@@ -749,6 +755,39 @@ class BayCanvas(QWidget):
         transform = QTransform(self._scale, 0, 0, -self._scale,
                                self.PAD, self._bay_px_h - self.PAD)
         return transform.map(world_path)
+
+    def _block_outer_rings(self, blk: "BlockItem", vis_indices: list,
+                          all_layers: list) -> list:
+        """Return cached exterior-ring coordinate lists (local/anchored space,
+        i.e. before translating by blk.x/blk.y or scaling to pixels) for the
+        union of blk's currently-visible layers.
+
+        Cached per block id and cleared only when block geometry/visibility
+        changes (mark_dirty/mark_dirty_for_block/mark_after_removal) -- the
+        union shape doesn't depend on scale, so repaints from cut-line drags or
+        zooming reuse it instead of recomputing unary_union. Also avoids
+        recomputing the same union 2-3x per paintEvent (outline, hatch overlay,
+        outside-bay highlight all needed it independently before).
+        """
+        cached = self._outer_union_cache.get(blk.id)
+        if cached is not None:
+            return cached
+        s_polys = [
+            ShapelyPolygon(all_layers[li])
+            for li in vis_indices
+            if all_layers[li] and len(all_layers[li]) >= 3
+        ]
+        rings = []
+        if s_polys:
+            outer = unary_union(s_polys)
+            geoms = list(outer.geoms) if hasattr(outer, 'geoms') else [outer]
+            for geom in geoms:
+                try:
+                    rings.append(list(geom.exterior.coords))
+                except AttributeError:
+                    continue
+        self._outer_union_cache[blk.id] = rings
+        return rings
 
     def _block_at(self, bx, by) -> Optional[BlockItem]:
         for blk in reversed(self.blocks):
@@ -1031,22 +1070,10 @@ class BayCanvas(QWidget):
                     painter.setClipping(False)
 
             # -- Solid outer union --------------------------------------------
-            s_polys = [
-                ShapelyPolygon(all_layers[li])
-                for li in vis_indices
-                if all_layers[li] and len(all_layers[li]) >= 3
-            ]
-            if not s_polys:
+            outer_rings = self._block_outer_rings(blk, vis_indices, all_layers)
+            if not outer_rings:
                 continue
-            outer = unary_union(s_polys)
-            geoms = list(outer.geoms) if hasattr(outer, 'geoms') else [outer]
-            outer_polys = []
-            for geom in geoms:
-                try:
-                    coords = list(geom.exterior.coords)
-                except AttributeError:
-                    continue
-                outer_polys.append(_to_qpoly(origin, coords, self._scale))
+            outer_polys = [_to_qpoly(origin, coords, self._scale) for coords in outer_rings]
 
             if is_failed:
                 # check_entry/check_exit failed: red thick solid outer line
@@ -1104,20 +1131,10 @@ class BayCanvas(QWidget):
         for blk, origin, vis_indices, all_layers in blk_entries:
             if blk.id not in self.exiting_block_ids:
                 continue
-            s_polys = [
-                ShapelyPolygon(all_layers[li])
-                for li in vis_indices
-                if all_layers[li] and len(all_layers[li]) >= 3
-            ]
-            if not s_polys:
+            outer_rings = self._block_outer_rings(blk, vis_indices, all_layers)
+            if not outer_rings:
                 continue
-            outer = unary_union(s_polys)
-            geoms = list(outer.geoms) if hasattr(outer, 'geoms') else [outer]
-            for geom in geoms:
-                try:
-                    coords = list(geom.exterior.coords)
-                except AttributeError:
-                    continue
+            for coords in outer_rings:
                 qpoly = _to_qpoly(origin, coords, self._scale)
                 path = QPainterPath()
                 path.addPolygon(qpoly)
@@ -1145,17 +1162,19 @@ class BayCanvas(QWidget):
         ])
         painter.setClipping(False)
         for blk, origin, vis_indices, all_layers in blk_entries:
+            outer_rings = self._block_outer_rings(blk, vis_indices, all_layers)
             world_polys = []
-            for li in vis_indices:
-                if all_layers[li] and len(all_layers[li]) >= 3:
-                    world_verts = [(blk.x + vx, blk.y + vy) for vx, vy in all_layers[li]]
-                    try:
-                        world_polys.append(ShapelyPolygon(world_verts))
-                    except Exception:
-                        pass
+            for ring in outer_rings:
+                try:
+                    world_polys.append(
+                        ShapelyPolygon([(blk.x + vx, blk.y + vy) for vx, vy in ring]))
+                except Exception:
+                    pass
             if not world_polys:
                 continue
-            world_union = unary_union(world_polys)
+            # outer_rings are already disjoint (they're the merged exterior
+            # boundary), so no unary_union() needed -- just wrap them.
+            world_union = world_polys[0] if len(world_polys) == 1 else ShapelyMultiPolygon(world_polys)
             outside = world_union.difference(bay_shapely)
             if outside.is_empty:
                 continue
@@ -1482,6 +1501,7 @@ class BayCanvas(QWidget):
     def mark_dirty(self):
         """Full recalculation -- used for layer toggle, bulk block changes, etc."""
         self._occlusion_cache.clear()
+        self._outer_union_cache.clear()
         bay = UtilsBay(width=int(self.bay_w), height=int(self.bay_h))
         # Blocks being EXITed are in crane-lifting state and excluded from collision checks
         util_blocks = [
@@ -1498,6 +1518,7 @@ class BayCanvas(QWidget):
     def mark_after_removal(self, removed_blk_id: int):
         """Called after a block is removed from the bay -- O(1) without Shapely."""
         self._occlusion_cache.clear()
+        self._outer_union_cache.clear()
         self._cached_collision_results = [
             r for r in self._cached_collision_results
             if r.block_a.block_id != removed_blk_id
@@ -1509,6 +1530,7 @@ class BayCanvas(QWidget):
     def mark_dirty_for_block(self, changed_blk_id: int):
         """Called after a block's position/rotation changes -- recomputes only pairs involving this block O(N)."""
         self._occlusion_cache.clear()
+        self._outer_union_cache.clear()
         # 1) Remove entries involving this block from previous results
         self._cached_collision_results = [
             r for r in self._cached_collision_results
