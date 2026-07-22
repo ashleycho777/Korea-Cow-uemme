@@ -184,12 +184,13 @@ class GanttCanvas(QWidget):
         p.setFont(font)
         pen_tick = QPen(QColor("#94a3b8"), 1)
         pen_label = QPen(QColor("#334155"), 1)
+        pen_gridline = QPen(QColor("#cbd5e1"), 1, Qt.PenStyle.DashLine)
 
         t = math.ceil(self._t_min / tick_step) * tick_step
         while t <= self._t_max + 1e-6:
             x = self._t_to_px(t)
             # Major tick line through all rows
-            p.setPen(QPen(QColor("#cbd5e1"), 1, Qt.PenStyle.DashLine))
+            p.setPen(pen_gridline)
             p.drawLine(QPointF(x, _AXIS_H), QPointF(x, self.height()))
             # Axis tick + label
             p.setPen(pen_tick)
