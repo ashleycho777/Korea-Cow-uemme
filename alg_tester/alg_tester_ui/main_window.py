@@ -68,13 +68,24 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Load Error", str(e))
             return
 
-        self._instance = instance
         n_bays   = len(instance.get("bays", []))
         n_blocks = len(instance.get("blocks", []))
-        self.control_panel.set_instance_info(n_bays, n_blocks)
 
-        self.tab_layout.set_instance(instance)
-        self.tab_solution.set_instance(instance)
+        # Apply to both tabs before committing self._instance -- if either tab
+        # rejects the instance (e.g. malformed schema), we must not end up with
+        # self._instance set while tab_solution's instance is still unset/stale,
+        # since that desync is what let the Run button get disabled forever
+        # (run_algorithm silently no-ops on a None instance without signaling
+        # run_finished, so nothing re-enables the button).
+        try:
+            self.tab_layout.set_instance(instance)
+            self.tab_solution.set_instance(instance)
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", f"Invalid instance format: {e}")
+            return
+
+        self._instance = instance
+        self.control_panel.set_instance_info(n_bays, n_blocks)
 
         name = instance.get("name", pathlib.Path(path).stem)
         self._status.showMessage(
