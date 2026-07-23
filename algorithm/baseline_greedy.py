@@ -31,7 +31,7 @@ Phase 2 -- Iterative repair:
       Each violating block keeps its current (bay, x, y, orient) and is only
       pushed to the next empty-bay window (bay completely empty for the full
       processing duration).  Stage-4 (spatial collision) violations are also
-      reset to position (0, 0).
+      reset to position (0,0).
 
 ===============================================================================
 SOLUTION DICT FORMAT

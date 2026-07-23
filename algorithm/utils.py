@@ -1438,3 +1438,4 @@ def check_feasibility(prob_info: dict, solution: dict) -> dict:
         "obj2":      obj2,
         "obj3":      obj3,
     }
+
