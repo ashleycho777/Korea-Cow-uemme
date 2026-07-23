@@ -94,11 +94,20 @@ class MainWindow(QMainWindow):
 
     # -- Algorithm folder selected --------------------------------------------
     def _on_algorithm_selected(self):
-        """Propagate the algorithm folder to SolutionTab."""
+        """Propagate the algorithm folder to SolutionTab.
+
+        Always mirrors control_panel's current folder (including "" when the
+        selection was rejected, e.g. myalgorithm.py missing) so tab_solution
+        can't keep a stale folder from a previous valid selection, and gives
+        status-bar feedback either way instead of silently doing nothing on
+        an invalid pick.
+        """
         folder = self.control_panel.algorithm_folder
+        self.tab_solution.set_algorithm_folder(folder)
         if folder:
-            self.tab_solution.set_algorithm_folder(folder)
             self._status.showMessage(f"Algorithm folder: {folder}")
+        else:
+            self._status.showMessage("Algorithm folder invalid -- myalgorithm.py not found")
 
     # -- Run ------------------------------------------------------------------
     def _on_run(self):
