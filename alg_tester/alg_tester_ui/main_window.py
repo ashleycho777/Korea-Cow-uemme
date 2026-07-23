@@ -135,6 +135,17 @@ class MainWindow(QMainWindow):
             self.tab_solution.set_algorithm_folder(alg_folder)
 
     def closeEvent(self, event):
+        if self.tab_solution.is_running():
+            reply = QMessageBox.question(
+                self, "Algorithm Running",
+                "An algorithm is still running. Stop it and close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.tab_solution.stop_algorithm()
         self.control_panel.save_settings()
         super().closeEvent(event)
 

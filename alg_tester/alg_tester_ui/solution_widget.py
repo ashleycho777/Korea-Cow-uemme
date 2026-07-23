@@ -593,6 +593,16 @@ class SolutionTab(QWidget):
     def status_text(self) -> str:
         return self._lbl_status.text()
 
+    def stop_algorithm(self):
+        """Best-effort kill of the running algorithm subprocess and its worker
+        threads. Called on app close so the user's algorithm subprocess doesn't
+        keep running orphaned in the background after the GUI exits."""
+        if self._worker is not None:
+            self._worker.kill()
+            self._worker.wait(3000)
+        if self._reader is not None:
+            self._reader.wait(1000)
+
     # -------------------------------------------------------------------------
     # Worker callbacks
     # -------------------------------------------------------------------------
