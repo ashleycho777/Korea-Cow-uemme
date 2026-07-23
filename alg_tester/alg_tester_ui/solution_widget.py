@@ -934,7 +934,9 @@ class SolutionTab(QWidget):
                             if o.existing_block.block_id != cur_bid
                         }
                 except Exception:
-                    pass
+                    # Best-effort obstruction highlight -- don't let a data
+                    # mismatch here break the viewer, but don't hide it either.
+                    traceback.print_exc()
         else:
             a = assign_by_id.get(cur_bid)
             if a is not None:
@@ -968,7 +970,9 @@ class SolutionTab(QWidget):
                                 if o.existing_block.block_id != cur_bid
                             }
                     except Exception:
-                        pass
+                        # Best-effort obstruction highlight -- don't let a data
+                        # mismatch here break the viewer, but don't hide it either.
+                        traceback.print_exc()
 
         for bc in self._bay_canvases:
             bc.mark_dirty()
