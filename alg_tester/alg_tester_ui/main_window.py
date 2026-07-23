@@ -131,4 +131,4 @@ class MainWindow(QMainWindow):
 
     def _on_run_finished(self):
         self.control_panel.btn_run.setEnabled(True)
-        self._status.showMessage(self.tab_solution._lbl_status.text())
+        self._status.showMessage(self.tab_solution.status_text())

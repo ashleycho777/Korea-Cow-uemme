@@ -590,6 +590,9 @@ class SolutionTab(QWidget):
     def is_running(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
 
+    def status_text(self) -> str:
+        return self._lbl_status.text()
+
     # -------------------------------------------------------------------------
     # Worker callbacks
     # -------------------------------------------------------------------------
