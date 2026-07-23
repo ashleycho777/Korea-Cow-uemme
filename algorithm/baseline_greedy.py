@@ -1000,7 +1000,7 @@ if __name__ == "__main__":
 
     t0  = time.time()
     sol = greedyalgorithm(prob_info, timelimit=args.timelimit, repair_mode=args.repair)
-    elapsed = time.time() - t0
+    elapsed = time.time() - t0 
 
     result = check_feasibility(prob_info, sol)
 
