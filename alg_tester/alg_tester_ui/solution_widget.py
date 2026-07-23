@@ -571,12 +571,9 @@ class SolutionTab(QWidget):
         worker.error.connect(self._on_run_error)
         worker.finished.connect(self._on_worker_finished)
 
-        # Stdout reader -- drains pipe and forwards lines live
-        reader = _StdoutReader(worker._proc if False else None)  # will be wired below
-
-        # We need the Popen object, which is created inside worker.run().
-        # So we wire the reader after the process starts: use a tiny wrapper
-        # that creates Popen here instead.
+        # Stdout reader -- drains pipe and forwards lines live. The Popen object
+        # is only created inside worker.run() (in the worker thread), so the
+        # reader is wired up in _on_proc_ready once that signal tells us it exists.
         worker.proc_ready.connect(self._on_proc_ready)
         self._worker = worker
         self._worker.start()
@@ -585,7 +582,15 @@ class SolutionTab(QWidget):
         """Called from the worker thread via Qt signal once Popen is alive."""
         self._reader = _StdoutReader(proc)
         self._reader.line_ready.connect(self._append_output)
+        self._reader.finished_reading.connect(self._on_reader_finished)
         self._reader.start()
+
+    def _on_reader_finished(self):
+        """Drop our reference to the finished reader thread so it can be
+        garbage-collected and stop_algorithm() doesn't wait on a stale one."""
+        if self._reader is not None:
+            self._reader.deleteLater()
+            self._reader = None
 
     def is_running(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
