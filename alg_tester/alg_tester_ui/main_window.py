@@ -94,11 +94,20 @@ class MainWindow(QMainWindow):
 
     # -- Algorithm folder selected --------------------------------------------
     def _on_algorithm_selected(self):
-        """Propagate the algorithm folder to SolutionTab."""
+        """Propagate the algorithm folder to SolutionTab.
+
+        Always mirrors control_panel's current folder (including "" when the
+        selection was rejected, e.g. myalgorithm.py missing) so tab_solution
+        can't keep a stale folder from a previous valid selection, and gives
+        status-bar feedback either way instead of silently doing nothing on
+        an invalid pick.
+        """
         folder = self.control_panel.algorithm_folder
+        self.tab_solution.set_algorithm_folder(folder)
         if folder:
-            self.tab_solution.set_algorithm_folder(folder)
             self._status.showMessage(f"Algorithm folder: {folder}")
+        else:
+            self._status.showMessage("Algorithm folder invalid -- myalgorithm.py not found")
 
     # -- Run ------------------------------------------------------------------
     def _on_run(self):
@@ -126,9 +135,20 @@ class MainWindow(QMainWindow):
             self.tab_solution.set_algorithm_folder(alg_folder)
 
     def closeEvent(self, event):
+        if self.tab_solution.is_running():
+            reply = QMessageBox.question(
+                self, "Algorithm Running",
+                "An algorithm is still running. Stop it and close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.tab_solution.stop_algorithm()
         self.control_panel.save_settings()
         super().closeEvent(event)
 
     def _on_run_finished(self):
         self.control_panel.btn_run.setEnabled(True)
-        self._status.showMessage(self.tab_solution._lbl_status.text())
+        self._status.showMessage(self.tab_solution.status_text())
